@@ -1,977 +1,151 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Factor Visualizer — Server-enabled Pollard-Brent (fixed)</title>
-<style>
-  :root{--bg:#0f1724;--panel:#0b1220;--accent:#22c1c3;--muted:#94a3b8}
-  html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial;color:#e6eef6;background:linear-gradient(180deg,#071129 0%, #071824 100%);}
-  .wrap{max-width:1200px;margin:18px auto;padding:18px}
-  header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
-  h1{font-size:18px;margin:0}
-  .card{background:rgba(255,255,255,0.02);padding:12px;border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,0.5)}
-  .controls{display:flex;gap:10px;flex-wrap:wrap}
-  input[type=number],select,textarea,input[type=text]{padding:8px;border-radius:8px;border:1px solid #123;background:#061223;color:#dff}
-  button{padding:8px 12px;border-radius:8px;border:none;background:var(--accent);color:#022;cursor:pointer}
-  button.secondary{background:#1f2937;color:#dff}
-  .row{display:flex;gap:12px;margin-top:12px}
-  .left{flex:1}
-  .right{width:360px}
-  canvas{background:#021021;border-radius:8px;display:block}
-  .stat{display:flex;justify-content:space-between;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.02);margin-bottom:6px}
-  .workerRow{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-  .bar{height:10px;background:#08202a;border-radius:8px;flex:1;overflow:hidden}
-  .barFill{height:100%;background:linear-gradient(90deg,var(--accent),#6ee7b7);width:0%}
-  .muted{color:var(--muted);font-size:13px}
-  footer{margin-top:10px;color:var(--muted)}
-  textarea{width:100%;height:120px;background:#061622;color:#dff;border-radius:8px;padding:8px;border:1px solid #123}
-  .log{font-size:12px;padding:8px;background:rgba(255,255,255,0.01);border-radius:8px;height:120px;overflow:auto}
-  .small{font-size:12px;color:var(--muted)}
-  label.inline{display:block;margin-bottom:6px}
-  .serverRow{display:flex;gap:8px;align-items:center}
-</style>
+  <meta charset="utf-8">
+  <title>Factor Hive Client</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    #log { white-space: pre; background:#f0f0f0; padding:10px; height:200px; overflow:auto; }
+    input { margin: 5px; }
+  </style>
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <h1>Factor Visualizer — Server-enabled Pollard-Brent (fixed)</h1>
-    </header>
-
-    <div class="card controls">
-      <div>
-        <label class="muted">N (big integer)</label><br>
-        <input id="inputN" type="text" value="10403" placeholder="e.g. 123456789012345678901" style="width:260px">
-      </div>
-
-      <div>
-        <label class="muted">Workers (local)</label><br>
-        <input id="workers" type="number" value="4" min="1" max="128" style="width:80px">
-      </div>
-
-      <div>
-        <label class="muted">Iterations / yield (worker)</label><br>
-        <input id="iterChunk" type="number" value="2000" min="100" step="100" style="width:120px">
-      </div>
-
-      <div>
-        <label class="muted">Delay (ms between UI updates)</label><br>
-        <input id="delay" type="number" value="80" min="0" style="width:100px">
-      </div>
-
-      <div style="display:flex;align-items:end;gap:8px">
-        <button id="startBtn">Start / Resume</button>
-        <button id="pauseBtn" class="secondary">Pause</button>
-        <button id="stopBtn" class="secondary">Stop</button>
-        <button id="resetBtn" class="secondary">Reset</button>
-      </div>
-
-      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
-        <button id="saveBtn" class="secondary">Save Local State</button>
-        <input id="loadFile" type="file" accept="application/json" style="display:inline-block">
-        <button id="pasteLoadBtn" class="secondary">Paste JSON to Load</button>
-      </div>
-
-      <div style="margin-top:12px" class="card">
-        <label class="inline muted"><input type="checkbox" id="serverMode"> Server Mode</label>
-        <div class="serverRow">
-          <input id="serverUrl" type="text" placeholder="wss://your-server.example" style="flex:1;padding:8px;border-radius:8px;border:1px solid #123;background:#061223;color:#dff">
-          <button id="connectServerBtn" class="secondary">Connect</button>
-        </div>
-        <div class="small muted" style="margin-top:6px">Server Mode syncs assignments & progress with a central orchestrator. Toggle when you want distributed work across multiple machines.</div>
-      </div>
-    </div>
-
-    <div class="row">
-      <div class="left card">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div class="muted">Speed graph — iterations/second (smoothed)</div>
-          <div id="status" class="muted">idle</div>
-        </div>
-        <canvas id="graph" width="820" height="300"></canvas>
-
-        <div style="margin-top:10px">
-          <div class="stat"><div class="muted">Total iterations</div><div id="totalIter">0</div></div>
-          <div class="stat"><div class="muted">Elapsed</div><div id="elapsed">0.00s</div></div>
-          <div class="stat"><div class="muted">Estimated time left</div><div id="eta">—</div></div>
-          <div class="stat"><div class="muted">Found</div><div id="found">—</div></div>
-        </div>
-      </div>
-
-      <div class="right card">
-        <div class="muted">Workers</div>
-        <div id="workerList" style="margin-top:8px"></div>
-
-        <div style="margin-top:10px" class="muted">Save/Load state</div>
-        <div class="muted">Save creates a JSON for local resume. In Server Mode the server keeps canonical state.</div>
-        <textarea id="pasteArea" placeholder='Paste saved JSON here to load (or use the file chooser)'></textarea>
-        <div style="margin-top:8px" class="log" id="logArea"></div>
-      </div>
-    </div>
-
-    <footer class="muted">Features: per-worker resume, server orchestration with persistent state, adaptive chunk tuning (target chunk time ~50–150ms), robust restarts with backoff/jitter.</footer>
-  </div>
+  <h1>Factor Hive Client</h1>
+  <label>Server URL: <input id="serverUrl" value="ws://localhost:3000"></label>
+  <button id="connectBtn">Connect</button>
+  <button id="startBtn">Start</button>
+  <button id="stopBtn">Stop</button>
+  <div id="log"></div>
 
 <script>
-/* ========= Utils & BigInt helpers ========= */
-const $ = id => document.getElementById(id);
-function now(){ return performance.now()/1000; }
-function toBigIntSafe(v){
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number') return BigInt(Math.floor(v || 0));
-  let s = String(v || '').trim();
-  if(s === '') return 0n;
-  try { return BigInt(s); } catch(e) { return 0n; }
-}
-function gcd(a,b){ a = a < 0n ? -a : a; b = b < 0n ? -b : b; while(b){ const t = a % b; a = b; b = t; } return a; }
-function modPow(base, exp, mod){ base = base % mod; let result = 1n; while(exp>0n){ if(exp & 1n) result = (result * base) % mod; base = (base * base) % mod; exp >>= 1n; } return result; }
-function isProbablyPrime(n){
-  if(n < 2n) return false;
-  const small = [2n,3n,5n,7n,11n,13n,17n,19n,23n,29n,31n];
-  for(const p of small){ if(n === p) return true; if(n % p === 0n) return false; }
-  let d = n - 1n, s = 0n;
-  while((d & 1n) === 0n){ d >>= 1n; s += 1n; }
-  const bases = [2n,325n,9375n,28178n,450775n,9780504n,1795265022n];
-  for(const a of bases){
-    if(a % n === 0n) continue;
-    let x = modPow(a, d, n);
-    if(x === 1n || x === n-1n) continue;
-    let cont = false;
-    for(let r=1n;r<s;r++){
-      x = (x*x) % n;
-      if(x === n-1n){ cont = true; break; }
-    }
-    if(cont) continue;
-    return false;
-  }
-  return true;
-}
-function kthRootBigInt(n,k){
-  if(n < 0n) throw new Error('negative'); if(n === 0n) return 0n;
-  let low = 1n, high = n;
-  while(low <= high){
-    const mid = (low + high) >> 1n;
-    let p = 1n;
-    for(let i=0;i<k;i++){ p *= mid; if(p > n) break; }
-    if(p === n) return mid;
-    if(p < n) low = mid + 1n; else high = mid - 1n;
-  }
-  return low - 1n;
-}
-
-/* ========= Worker code (string blob) ========= */
-const workerSource = `
-let running = false, paused = false, chunk = 2000, taskId = null, id = null;
-self.onmessage = async (e) => {
-  const m = e.data;
-  if(m.cmd === 'start'){
-    const N = BigInt(m.N);
-    id = m.id;
-    taskId = m.taskId;
-    chunk = Number(m.chunk) || chunk;
-    const c = BigInt(m.c);
-    running = true; paused = false;
-    function modMul(a,b,m){ return (a*b) % m; }
-    function f(x){ return (modMul(x,x,N) + c) % N; }
-    function abs(a){ return a<0n?-a:a; }
-    try{
-      let y = 2n, r = 1n, q = 1n, iterations = 0n;
-      let lastHeartbeat = performance.now();
-      while(r < (1n << 62n) && running){
-        let x = y; for(let i=0n;i<r;i++) y = f(y);
-        let k = 0n;
-        while(k < r && running){
-          let ys = y;
-          const limit = (r - k) < BigInt(chunk) ? Number(r - k) : chunk;
-          for(let i=0;i<limit && running;i++){
-            y = f(y);
-            q = (q * ( (x>y)?(x-y):(y-x) )) % N;
-            iterations++;
-            const now = performance.now();
-            if(now - lastHeartbeat > 800){ self.postMessage({type:'heartbeat', id, taskId, iterations: iterations.toString()}); lastHeartbeat = now; }
-            if(iterations % BigInt(chunk) === 0n){
-              self.postMessage({type:'progress', id, taskId, iterations: iterations.toString()});
-              if(paused){ await new Promise(r=>{ const rr=r; self._resume = () => { rr(); }; }); self._resume = null; }
-            }
-          }
-          // gcd(q, N)
-          let a = q < 0n ? -q : q, b = N < 0n ? -N : N;
-          while(b){ const t = a % b; a = b; b = t; }
-          const d = a;
-          if(d !== 1n && d !== N){
-            self.postMessage({type:'found', id, taskId, factor: d.toString(), iterations: iterations.toString()}); return;
-          }
-          if(d === N){
-            let factor = 1n; let t = ys;
-            while(t !== y){
-              t = f(t);
-              let aa = x - t; if(aa<0n) aa = -aa;
-              let bb = N < 0n ? -N : N;
-              let a2 = aa, b2 = bb;
-              while(b2){ const tt = a2 % b2; a2 = b2; b2 = tt; }
-              factor = a2;
-              if(factor > 1n && factor < N){ self.postMessage({type:'found', id, taskId, factor: factor.toString(), iterations: iterations.toString()}); return; }
-            }
-            self.postMessage({type:'failed', id, taskId, iterations: iterations.toString()}); return;
-          }
-          k += BigInt(limit);
-        }
-        r *= 2n;
-      }
-      self.postMessage({type:'failed', id, taskId, iterations: iterations.toString()});
-    } catch(err){ self.postMessage({type:'error', id, taskId, msg: String(err)}); }
-  } else if(m.cmd === 'pause'){ paused = true; } else if(m.cmd === 'resume'){ if(paused && self._resume){ paused = false; self._resume(); } } else if(m.cmd === 'stop'){ running = false; paused = false; if(self._resume){ self._resume(); self._resume = null; } }
-  else if(m.cmd === 'setChunk'){ const newChunk = Number(m.chunk); if(newChunk && newChunk > 0){ chunk = newChunk; self.postMessage({type:'chunkAck', id: m.id, taskId, chunk}); } }
-};
-`;
-
-const workerBlob = new Blob([workerSource], {type:'application/javascript'});
-const workerURL = URL.createObjectURL(workerBlob);
-
-/* ========= App state ========= */
-let workers = [];
+let ws;
 let state = {
-  originalN: null,   // user-entered, canonical N (string or BigInt)
-  N_work: null,      // reduced N that workers factor (BigInt)
+  originalN: null,
+  N_work: null,
   totalIterations: 0n,
-  t0: 0,
-  running: false,
-  records: [],
-  found: null,
-  emaRate: 0,
-  smallFactors: []   // small prime factors removed by trial division (BigInt array)
+  found: null
 };
-let adaptive = { lastAdjust: 0, chunk: Number(document.getElementById('iterChunk')?.value || 2000), targetChunkMs: 100 };
+let workers = {};
+let workerCount = 0;
 
-/* DOM refs */
-const inputN = $('inputN'), workersInput = $('workers'), iterChunkInput = $('iterChunk'), delayInput = $('delay');
-const startBtn = $('startBtn'), pauseBtn = $('pauseBtn'), stopBtn = $('stopBtn'), resetBtn = $('resetBtn');
-const saveBtn = $('saveBtn'), loadFile = $('loadFile'), pasteLoadBtn = $('pasteLoadBtn'), pasteArea = $('pasteArea');
-const graphCanvas = $('graph'), graphCtx = graphCanvas.getContext('2d');
-const totalIterEl = $('totalIter'), elapsedEl = $('elapsed'), foundEl = $('found'), statusEl = $('status'), workerListEl = $('workerList'), etaEl = $('eta'), logArea = $('logArea');
-const serverModeCheckbox = $('serverMode'), serverUrlInput = $('serverUrl'), connectServerBtn = $('connectServerBtn');
-
-function log(msg){ const t = new Date().toLocaleTimeString(); logArea.innerText = `[${t}] ${msg}\n` + logArea.innerText; if(logArea.innerText.length > 20000) logArea.innerText = logArea.innerText.slice(0,20000); }
-
-/* Graphing & UI helpers */
-function clearGraph(){ graphCtx.fillStyle='#021021'; graphCtx.fillRect(0,0,graphCanvas.width,graphCanvas.height); }
-function drawSpeedGraph(){
-  clearGraph();
-  const rec = state.records;
-  if(rec.length < 2) return;
-  const speeds=[];
-  for(let i=1;i<rec.length;i++){ const dt=rec[i].t-rec[i-1].t; const dit=rec[i].it-rec[i-1].it; const s = dt>1e-6 ? (dit/dt) : 0; speeds.push(s); }
-  if(speeds.length===0) return;
-  const smooth=[]; const window = Math.min(8, speeds.length);
-  for(let i=0;i<speeds.length;i++){
-    let sum=0,cnt=0;
-    for(let j=Math.max(0,i-window+1); j<=i; j++){ sum+=speeds[j]; cnt++; }
-    smooth.push(sum/cnt);
-  }
-  const maxSpeed = Math.max(...smooth)*1.15 || 1;
-  graphCtx.strokeStyle='rgba(255,255,255,0.04)'; graphCtx.lineWidth=1;
-  const rows=4, cols=6;
-  for(let y=0;y<=rows;y++){ const yy=(y/rows)*graphCanvas.height; graphCtx.beginPath(); graphCtx.moveTo(0,yy); graphCtx.lineTo(graphCanvas.width,yy); graphCtx.stroke(); }
-  for(let x=0;x<=cols;x++){ const xx=(x/cols)*graphCanvas.width; graphCtx.beginPath(); graphCtx.moveTo(xx,0); graphCtx.lineTo(xx,graphCanvas.height); graphCtx.stroke(); }
-  graphCtx.beginPath(); for(let i=0;i<smooth.length;i++){ const x=(i/(smooth.length-1))*graphCanvas.width; const y=graphCanvas.height-(smooth[i]/maxSpeed)*graphCanvas.height; if(i===0) graphCtx.moveTo(x,y); else graphCtx.lineTo(x,y); }
-  graphCtx.lineWidth=2; graphCtx.strokeStyle='#22c1c3'; graphCtx.stroke();
-  graphCtx.fillStyle='#cfe'; graphCtx.font='12px system-ui'; graphCtx.textAlign='right';
-  for(let r=0;r<=rows;r++){ const v=Math.round((maxSpeed*(rows-r))/rows); const yy=(r/rows)*graphCanvas.height + 10; graphCtx.fillText(v.toString()+' it/s', graphCanvas.width-6, yy); }
+function log(msg){
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
 }
+function toBigIntSafe(x){ try { return BigInt(x); } catch { return null; } }
 
-function humanDurationFromSeconds(s){
-  if(!isFinite(s) || s < 0) return '—';
-  const units = [
-    {u:'s', v:1},
-    {u:'m', v:60},
-    {u:'h', v:3600},
-    {u:'d', v:3600*24},
-    {u:'w', v:3600*24*7},
-    {u:'mo', v:3600*24*30},
-    {u:'y', v:3600*24*365},
-    {u:'century', v:3600*24*365*100}
-  ];
-  if(s < 60) return s.toFixed(2) + ' s';
-  for(let i=1;i<units.length;i++){
-    if(s < units[i].v * (i===units.length-1 ? 1000 : (i===units.length-2?100:10))){
-      const val = s / units[i].v;
-      return val.toFixed(val >= 10 ? 0 : 2) + ' ' + units[i].u;
-    }
-  }
-  return '>1e9 s';
-}
-
-function safeApproxRemainingSeconds(remainingBigInt, rate){
-  if(remainingBigInt === 0n) return 0;
-  if(rate <= 0) return Infinity;
-  const maxSafe = BigInt(1e15);
-  if(remainingBigInt <= maxSafe) return Number(remainingBigInt) / rate;
-  const digits = remainingBigInt.toString().length;
-  const trim = Math.max(0, digits - 12);
-  const divisor = 10n ** BigInt(trim);
-  const approx = Number(remainingBigInt / divisor);
-  return (approx * Number(divisor)) / rate;
-}
-
-function updateUI(){
-  totalIterEl.textContent = state.totalIterations.toString();
-  const elapsed = state.t0 ? (now()-state.t0) : 0;
-  elapsedEl.textContent = elapsed.toFixed(2) + 's';
-  foundEl.textContent = state.found ? (state.found.p + ' × ' + (state.found.q || '???')) : '—';
-  statusEl.textContent = state.running ? (serverConnected? 'server running' : 'running') : (serverConnected? 'server idle' : 'idle');
-
-  const tNow = elapsed;
-  state.records.push({t: tNow, it: Number(state.totalIterations > 9_000_000_000_000_000n ? 9e15 : state.totalIterations)});
-  if(state.records.length > 240) state.records.shift();
-
-  if(state.records.length >= 2){
-    const last = state.records[state.records.length-1];
-    const prev = state.records[state.records.length-2];
-    const dt = last.t - prev.t;
-    const dit = last.it - prev.it;
-    const inst = dt > 1e-6 ? (dit/dt) : 0;
-    const alpha = 0.2;
-    state.emaRate = state.emaRate ? (alpha*inst + (1-alpha)*state.emaRate) : inst;
-  }
-
-  // ETA ...
-  let etaText = '—';
-  if(state.emaRate > 1e-6 && state.N_work){
-    try {
-      const root4 = kthRootBigInt(state.N_work, 4);
-      const target = root4 * 2n;
-      const remaining = target > state.totalIterations ? (target - state.totalIterations) : 0n;
-      if(remaining === 0n) etaText = '0s';
-      else {
-        const approxSecs = (remaining <= 1_000_000_000_000_000n) ? (Number(remaining) / state.emaRate) : safeApproxRemainingSeconds(remaining, state.emaRate);
-        if(!isFinite(approxSecs) || approxSecs > 1e12) etaText = humanDurationFromSeconds(1e12);
-        else etaText = humanDurationFromSeconds(approxSecs);
+// --- Worker script (inline) ---
+const workerScript = `
+self.onmessage = function(e){
+  const {cmd, N, id, c, chunk, taskId} = e.data;
+  if(cmd==="start"){
+    const Nn = BigInt(N);
+    let x=2n, y=2n, d=1n;
+    let count = 0n;
+    function f(x){ return (x*x + BigInt(c)) % Nn; }
+    while(true){
+      x=f(x); y=f(f(y));
+      d = gcd(abs(x-y), Nn);
+      count++;
+      if(d>1n && d<Nn){
+        self.postMessage({type:"found", factor:d.toString(), id, taskId});
+        break;
       }
-    } catch(e){ etaText = '—'; }
-  } else {
-    etaText = state.running ? 'estimating...' : '—';
-  }
-  etaEl.textContent = etaText;
-  drawSpeedGraph();
-}
-
-/* ========= Worker UI rendering ========= */
-function renderWorkerRow(info){
-  let el = document.getElementById('w-' + info.id);
-  if(!el){
-    el = document.createElement('div');
-    el.id = 'w-' + info.id;
-    el.className = 'workerRow';
-    el.innerHTML = `<div style="width:36px">W${info.id}</div><div class='bar'><div class='barFill' id='wbar-${info.id}'></div></div><div style='width:140px;text-align:right' id='wstat-${info.id}'></div>`;
-    workerListEl.appendChild(el);
-  }
-  const fill = document.getElementById('wbar-' + info.id);
-  const stat = document.getElementById('wstat-' + info.id);
-  const iterNum = info.iterations || info.lastReported || 0n;
-  const prog = Math.min(100, Number(iterNum % 100000n) / 1000);
-  if(fill) fill.style.width = prog + '%';
-  if(stat) stat.textContent = `${info.status} · ${iterNum.toString()}`;
-}
-
-/* ========= Local worker spawn & messaging ========= */
-function spawnWorker(info, chunk){
-  const w = new Worker(workerURL);
-  info.worker = w;
-  info.status = info.status || 'starting';
-  info.lastResponseAt = now();
-  info.pendingAckTimeout = null;
-
-  w.onmessage = (ev) => {
-    const m = ev.data;
-    info.lastResponseAt = now();
-    if(m.type === 'heartbeat' || m.type === 'progress'){
-      const iterSinceStart = BigInt(m.iterations || '0');
-      const workerTotal = (info.offset || 0n) + iterSinceStart;
-      const prev = info.lastReported || 0n;
-      const delta = workerTotal - prev;
-      if(delta > 0n){
-        state.totalIterations += delta;
-        info.lastReported = workerTotal;
-        info.iterations = workerTotal;
-        // forward to server if in server mode and assigned task
-        if(serverConnected && assignedTasksByWorkerId[info.id]) {
-          sendServerProgress(assignedTasksByWorkerId[info.id].taskId, delta.toString());
-        }
+      if(count % BigInt(chunk)===0n){
+        self.postMessage({type:"progress", id, taskId, offset:count.toString()});
       }
-      info.status = 'running';
-      renderWorkerRow(info);
-    } else if(m.type === 'chunkAck'){
-      if(info.pendingAckTimeout){ clearTimeout(info.pendingAckTimeout); info.pendingAckTimeout = null; }
-      info.status = 'chunk-ok';
-      info.lastResponseAt = now();
-      renderWorkerRow(info);
-      log(`Worker ${info.id} acked chunk=${m.chunk}`);
-    } else if(m.type === 'found'){
-      // Safer handling: validate factor against original and worker-assigned N
-      const iterSinceStart = BigInt(m.iterations || '0');
-      const workerTotal = (info.offset || 0n) + iterSinceStart;
-      info.lastReported = workerTotal;
-      info.iterations = workerTotal;
-      info.status = 'found';
-      renderWorkerRow(info);
-
-      try {
-        const factor = BigInt(m.factor);
-        const origN = state.originalN ? toBigIntSafe(state.originalN) : null;
-        const workerN = info.taskN ? toBigIntSafe(info.taskN) : (state.N_work || origN || null);
-        if(!workerN || !origN){
-          log(`Missing canonical N to validate factor ${factor}. Ignoring.`);
-          return;
-        }
-        if(workerN % factor !== 0n){
-          log(`Worker ${info.id} reported factor ${factor} which does NOT divide its assigned N (${workerN}). Ignoring.`);
-          return;
-        }
-        if(origN % factor !== 0n){
-          log(`Worker ${info.id} reported factor ${factor} which does NOT divide original N (${origN}). Ignoring.`);
-          return;
-        }
-        // compute cofactor relative to originalN
-        const other = origN / factor;
-        // canonicalize with smallFactors if any
-        let pStr = factor.toString();
-        let qStr = other.toString();
-        if(state.smallFactors && state.smallFactors.length > 0){
-          const smallProd = state.smallFactors.reduce((acc, x) => acc * toBigIntSafe(x), 1n);
-          if(other % smallProd === 0n){
-            qStr = (other / smallProd).toString();
-            state.found = { p: pStr, q: (state.smallFactors.map(x=>x.toString()).join(' × ') + ' × ' + qStr) };
-          } else {
-            state.found = { p: pStr, q: qStr };
-          }
-        } else {
-          state.found = { p: pStr, q: qStr };
-        }
-        state.running = false;
-        terminateWorkers();
-        updateUI();
-        log(`FOUND factor ${factor.toString()} (validated)`);
-        if(serverConnected) sendServerFound(factor.toString());
-      } catch(err){
-        log('Error validating factor: ' + err);
-      }
-    } else if(m.type === 'failed'){
-      info.failures = (info.failures || 0) + 1;
-      info.lastFailureAt = now();
-      info.status = 'failed';
-      renderWorkerRow(info);
-      scheduleWorkerRestartWithBackoff(info);
-    } else if(m.type === 'error'){
-      info.failures = (info.failures || 0) + 1;
-      info.status = 'error';
-      renderWorkerRow(info);
-      scheduleWorkerRestartWithBackoff(info);
-    }
-    if(Math.random() < 0.35) updateUI();
-  };
-
-  w.onerror = (err) => {
-    info.failures = (info.failures || 0) + 1;
-    info.status = 'error';
-    renderWorkerRow(info);
-    scheduleWorkerRestartWithBackoff(info);
-    log(`Worker ${info.id} error: ${err?.message || err}`);
-  };
-
-  return w;
-}
-
-function scheduleWorkerRestartWithBackoff(info){
-  if(info.restarting) return;
-  info.restarting = true;
-  const base = 500;
-  const backoff = Math.min(60000, base * Math.pow(2, Math.min(info.failures || 0, 10)));
-  const delay = backoff + (info.id * 60) + (Math.random()*300);
-  log(`Scheduling restart of worker ${info.id} in ${(delay/1000).toFixed(2)}s (failures=${info.failures||0})`);
-  setTimeout(()=>{
-    try{ if(info.worker) info.worker.terminate(); }catch(e){}
-    info.offset = info.lastReported || info.offset || 0n;
-    info.lastReported = info.offset;
-    info.iterations = info.offset;
-    info.status = 'restarting';
-    renderWorkerRow(info);
-    info.c = info.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-    // ensure the worker gets the right N
-    const NforWorker = (info.taskN || state.N_work || state.originalN || state.N_work || inputN.value).toString();
-    info.taskN = NforWorker;
-    const w = spawnWorker(info, adaptive.chunk);
-    info.worker = w;
-    w.postMessage({cmd:'start', N: NforWorker, id: info.id, c: info.c, chunk: adaptive.chunk, taskId: info.taskId || null});
-    info.lastResponseAt = now();
-    info.restarting = false;
-  }, delay);
-}
-
-/* Restart worker chunk in-place or respawn if unresponsive */
-function restartWorkersSequentially(newChunk){
-  if(workers.length === 0) return;
-  adaptive.chunk = newChunk;
-  let i = 0;
-  const step = ()=>{
-    if(i >= workers.length) return;
-    const info = workers[i];
-    if(info.worker){
-      try{
-        info.worker.postMessage({cmd:'setChunk', id: info.id, chunk: newChunk});
-        info.status='updating-chunk';
-        renderWorkerRow(info);
-        if(info.pendingAckTimeout) clearTimeout(info.pendingAckTimeout);
-        info.pendingAckTimeout = setTimeout(()=>{
-          if((now() - (info.lastResponseAt||0)) > 3){
-            try{ info.worker.terminate(); }catch(e){}
-            info.offset = info.lastReported || info.offset || 0n;
-            info.lastReported = info.offset;
-            info.iterations = info.offset;
-            info.status='restarting-chunk';
-            renderWorkerRow(info);
-            info.c = info.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-            const NforWorker = (info.taskN || state.N_work || state.originalN || inputN.value).toString();
-            info.taskN = NforWorker;
-            const w = spawnWorker(info, newChunk);
-            info.worker = w;
-            w.postMessage({cmd:'start', N: NforWorker, id: info.id, c: info.c, chunk: newChunk, taskId: info.taskId || null});
-          }
-          info.pendingAckTimeout = null;
-        }, 3000);
-      } catch(e){
-        try{ info.worker.terminate(); }catch(e){}
-        info.offset = info.lastReported || info.offset || 0n;
-        info.lastReported = info.offset;
-        info.iterations = info.offset;
-        info.status='restarting-chunk';
-        renderWorkerRow(info);
-        info.c = info.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-        const NforWorker = (info.taskN || state.N_work || state.originalN || inputN.value).toString();
-        info.taskN = NforWorker;
-        const w = spawnWorker(info, newChunk);
-        info.worker = w;
-        w.postMessage({cmd:'start', N: NforWorker, id: info.id, c: info.c, chunk: newChunk, taskId: info.taskId || null});
-      }
-    } else {
-      info.offset = info.lastReported || info.offset || 0n;
-      info.lastReported = info.offset;
-      info.iterations = info.offset;
-      info.status='starting';
-      renderWorkerRow(info);
-      info.c = info.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-      const NforWorker = (info.taskN || state.N_work || state.originalN || inputN.value).toString();
-      info.taskN = NforWorker;
-      const w = spawnWorker(info, newChunk);
-      info.worker = w;
-      w.postMessage({cmd:'start', N: NforWorker, id: info.id, c: info.c, chunk: newChunk, taskId: info.taskId || null});
-    }
-    i++; setTimeout(step, 120 + Math.random()*80);
-  };
-  step();
-}
-
-/* Terminate workers */
-function terminateWorkers(){
-  workers.forEach(w=>{ try{ if(w.pendingAckTimeout) clearTimeout(w.pendingAckTimeout); if(w.worker) w.worker.terminate(); }catch(e){} });
-  workers = [];
-  log('All workers terminated.');
-}
-
-/* Monitor loop to restart stuck workers */
-function monitorWorkers(){
-  workers.forEach(info=>{
-    if(!info.worker) return;
-    const idle = now() - (info.lastResponseAt || 0);
-    if(idle > 20 && !info.restarting){
-      info.status = 'stuck';
-      renderWorkerRow(info);
-      info.restarting = true;
-      info.failures = (info.failures || 0) + 1;
-      scheduleWorkerRestartWithBackoff(info);
-    }
-  });
-}
-
-/* ========= Start/Pause/Stop/Reset ========= */
-function startWorkers(){
-  if(state.found){ alert('Factor already found: ' + JSON.stringify(state.found)); return; }
-  if(startWorkers._starting) return;
-  startWorkers._starting = true;
-
-  const k = Math.max(1, Math.min(128, Number(workersInput.value) || 4));
-  adaptive.chunk = Math.max(100, Number(iterChunkInput.value) || 2000);
-
-  const Nraw = inputN.value.trim();
-  const N = toBigIntSafe(Nraw);
-  if(N < 4n){ alert('Please enter N >= 4'); startWorkers._starting = false; return; }
-
-  // preserve canonical originalN
-  state.originalN = state.originalN || N;
-  if(!state.t0) state.t0 = now();
-  state.running = true;
-
-  // modest trial division on fresh run to remove tiny primes
-  if(state.totalIterations === 0n && (!state.N_work)){
-    let nrem = state.originalN;
-    state.smallFactors = state.smallFactors || [];
-    const smallLimit = 5000;
-    for(let p=2;p<=smallLimit;p++){
-      const bp = BigInt(p);
-      while(nrem % bp === 0n){
-        state.smallFactors.push(bp);
-        nrem /= bp;
-      }
-      if(bp*bp > nrem) break;
-    }
-    if(nrem === 1n){
-      // completely factored
-      state.found = { p: state.smallFactors.map(x=>x.toString()).join(' × '), q: '1' };
-      state.running = false; updateUI(); startWorkers._starting = false; return;
-    }
-    state.N_work = nrem; // workers should factor this
-  }
-
-  // spawn logic: server mode vs local
-  if(serverConnected){
-    requestServerTasks(k);
-  } else {
-    workers = [];
-    for(let i=0;i<k;i++){
-      const c = (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-      const NforWorker = (state.N_work || state.originalN || N).toString();
-      const info = {
-        id: i,
-        worker: null,
-        offset: 0n,
-        lastReported: 0n,
-        iterations: 0n,
-        status: 'starting',
-        c,
-        failures: 0,
-        restarting: false,
-        lastResponseAt: now(),
-        taskId: `local-${i}`,
-        taskN: NforWorker
-      };
-      workers.push(info);
-      renderWorkerRow(info);
-      const w = spawnWorker(info, adaptive.chunk);
-      info.worker = w;
-      w.postMessage({cmd:'start', N: NforWorker, id:i, c: c, chunk: adaptive.chunk, taskId: info.taskId});
     }
   }
+};
+function abs(a){ return a<0n?-a:a; }
+function gcd(a,b){ while(b){ [a,b] = [b, a%b]; } return a; }
+`;
+const workerURL = URL.createObjectURL(new Blob([workerScript], {type:'application/javascript'}));
 
-  (function tick(){
-    if(state.running){
-      updateUI();
-      adaptiveAdjust();
-      monitorWorkers();
-      setTimeout(tick, Number(delayInput.value));
-    } else updateUI();
-  })();
-
-  startWorkers._starting = false;
-}
-
-function pauseWorkers(){
-  workers.forEach(info=>{
-    try{ if(info.worker) info.worker.postMessage({cmd:'pause'}); info.status='paused'; }catch(e){} renderWorkerRow(info);
-  });
-  state.running = false;
-  statusEl.textContent = 'paused';
-  updateUI();
-  if(serverConnected) sendServerStatus('paused');
-}
-
-function stopWorkers(){
-  terminateWorkers();
-  state.running = false;
-  statusEl.textContent = 'stopped';
-  updateUI();
-  if(serverConnected) sendServerStatus('stopped');
-}
-
-function resetState(){
-  state.originalN = toBigIntSafe(inputN.value || '0');
-  state.N_work = null;
-  state.totalIterations = 0n;
-  state.t0 = 0;
-  state.running = false;
-  state.records = [];
-  state.found = null;
-  state.emaRate = 0;
-  state.smallFactors = [];
-  terminateWorkers();
-  workerListEl.innerHTML = '';
-  clearGraph();
-  updateUI();
-  log('State reset.');
-  if(serverConnected) sendServerStateRequest();
-}
-
-/* Adaptive chunk tuning */
-function adaptiveAdjust(){
-  const t = now();
-  if(t - adaptive.lastAdjust < 2) return;
-  adaptive.lastAdjust = t;
-  const prevChunk = adaptive.chunk;
-  const rate = state.emaRate || 0;
-  if(rate > 1e-6){
-    const ideal = Math.max(200, Math.round(rate * (adaptive.targetChunkMs/1000)));
-    const upper = Math.min(200000, Math.round(prevChunk * 2));
-    const lower = Math.max(100, Math.round(prevChunk / 2));
-    adaptive.chunk = Math.max(lower, Math.min(upper, ideal));
-  } else {
-    if(prevChunk < 200000) adaptive.chunk = Math.min(200000, Math.round(prevChunk * 1.2));
-  }
-  if(adaptive.chunk !== prevChunk && workers.length > 0){
-    restartWorkersSequentially(adaptive.chunk);
-    log(`Adaptive chunk changed ${prevChunk} → ${adaptive.chunk}`);
-  }
-}
-
-/* ========= Save / Load local ========= */
-function buildSaveObject(){
-  return {
-    meta: { savedAt: (new Date()).toISOString(), version: 11 },
-    originalN: state.originalN ? state.originalN.toString() : null,
-    N_work: state.N_work ? state.N_work.toString() : null,
-    totalIterations: state.totalIterations.toString(),
-    elapsed: (state.t0 ? (now() - state.t0) : 0).toFixed(2),
-    records: state.records.slice(-240),
-    found: state.found,
-    smallFactors: (state.smallFactors || []).map(x => x.toString()),
-    workersRequested: Number(workersInput.value),
-    iterChunk: Number(iterChunkInput.value),
-    delay: Number(delayInput.value),
-    perWorker: workers.map(w => ({
-      id: w.id,
-      offset: (w.lastReported || w.offset || 0n).toString(),
-      c: w.c,
-      failures: w.failures || 0,
-      status: w.status || 'idle',
-      iterations: (w.iterations || w.lastReported || 0n).toString(),
-      taskId: w.taskId || null,
-      taskN: w.taskN || null
-    }))
+// --- Server comms ---
+function connect(){
+  const url = document.getElementById("serverUrl").value;
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    log("Connected to server.");
+    ws.send(JSON.stringify({type:"register", capacity:1}));
   };
-}
-
-saveBtn.addEventListener('click', ()=>{
-  const obj = buildSaveObject();
-  const blob = new Blob([JSON.stringify(obj)], {type:'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `factor-state-${Date.now()}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-  log('State saved to file.');
-});
-
-loadFile.addEventListener('change', async (ev)=>{
-  const f = ev.target.files[0];
-  if(!f) return;
-  const text = await f.text();
-  try{ loadStateFromJSON(text); } catch(e){ alert('Invalid file'); log('Load failed: invalid file.'); }
-});
-
-pasteLoadBtn.addEventListener('click', ()=>{
-  const text = pasteArea.value.trim();
-  if(!text) return;
-  try{ loadStateFromJSON(text); } catch(e){ alert('Invalid JSON'); log('Load failed: invalid JSON.'); }
-});
-
-function loadStateFromJSON(text){
-  const obj = JSON.parse(text);
-  if(!obj.originalN && !obj.N_work && !obj.totalIterations) throw new Error('invalid save');
-  state.originalN = toBigIntSafe(obj.originalN || obj.N_work || obj.N);
-  state.N_work = obj.N_work ? toBigIntSafe(obj.N_work) : (state.originalN);
-  state.totalIterations = toBigIntSafe(obj.totalIterations || '0');
-  state.records = (obj.records || []).slice(0,240).map(r=>({t:r.t, it:r.it}));
-  state.found = obj.found || null;
-  state.smallFactors = (obj.smallFactors || []).map(x => toBigIntSafe(x));
-  workersInput.value = obj.workersRequested || workersInput.value;
-  iterChunkInput.value = obj.iterChunk || iterChunkInput.value;
-  delayInput.value = obj.delay || delayInput.value;
-  inputN.value = state.originalN ? state.originalN.toString() : inputN.value;
-
-  // rebuild worker metadata (no threads)
-  workers = [];
-  const per = obj.perWorker || [];
-  const k = Math.max(1, Number(workersInput.value) || 4);
-  for(let i=0;i<k;i++){
-    const p = per.find(x => Number(x.id) === i);
-    const info = {
-      id: i,
-      worker: null,
-      offset: toBigIntSafe(p?.offset || '0'),
-      lastReported: toBigIntSafe(p?.offset || '0'),
-      iterations: toBigIntSafe(p?.iterations || p?.offset || '0'),
-      status: p?.status || 'idle',
-      c: p?.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString(),
-      failures: p?.failures || 0,
-      restarting: false,
-      lastResponseAt: now(),
-      taskId: p?.taskId || `local-${i}`,
-      taskN: p?.taskN || (state.N_work ? state.N_work.toString() : state.originalN ? state.originalN.toString() : null)
-    };
-    workers.push(info);
-    renderWorkerRow(info);
-  }
-  state.t0 = now() - (Number(obj.elapsed) || 0);
-  state.running = false;
-  updateUI();
-  alert('State loaded — click Start / Resume to spawn workers and continue.');
-  log('State loaded from JSON. Ready to resume.');
-}
-
-/* ========= Controls wiring ========= */
-startBtn.addEventListener('click', ()=>{ startWorkers(); });
-pauseBtn.addEventListener('click', ()=>{ pauseWorkers(); });
-stopBtn.addEventListener('click', ()=>{ stopWorkers(); });
-resetBtn.addEventListener('click', ()=>{ resetState(); });
-
-iterChunkInput.addEventListener('change', ()=>{
-  const newChunk = Math.max(100, Number(iterChunkInput.value) || 2000);
-  adaptive.chunk = newChunk;
-  if(workers.length > 0) restartWorkersSequentially(newChunk);
-  log(`User changed iterChunk to ${newChunk}`);
-});
-
-/* ========= Server integration ========= */
-let ws = null, serverConnected = false, clientId = null;
-let assignedTasksByWorkerId = {}; // local workerId -> {taskId, c, offset}
-function makeClientId(){ return 'c-' + Math.random().toString(36).slice(2,10); }
-
-connectServerBtn.addEventListener('click', ()=>{
-  const url = serverUrlInput.value.trim();
-  if(!url){ alert('Enter server URL'); return; }
-  connectToServer(url);
-});
-
-function connectToServer(url){
-  if(ws){ try{ ws.close(); }catch(e){} ws = null; serverConnected = false; }
-  try{
-    ws = new WebSocket(url);
-  } catch(e){
-    alert('Failed to construct WebSocket');
-    return;
-  }
-  clientId = clientId || makeClientId();
-  ws.onopen = ()=> {
-    serverConnected = true;
-    log('Connected to server.');
-    const payload = { type:'register', clientId, capacity: Number(workersInput.value) || 4, meta: { ua: navigator.userAgent } };
-    ws.send(JSON.stringify(payload));
-    requestServerTasks(Number(workersInput.value) || 4);
-    updateUI();
+  ws.onmessage = ev => {
+    const m = JSON.parse(ev.data);
+    handleServerMessage(m);
   };
-  ws.onmessage = (ev) => {
-    try {
-      const m = JSON.parse(ev.data);
-      handleServerMessage(m);
-    } catch(e){
-      log('Bad server message: ' + ev.data);
-    }
-  };
-  ws.onclose = () => { serverConnected = false; log('Disconnected from server'); updateUI(); handleServerDisconnectCleanup(); };
-  ws.onerror = (e) => { log('Server connection error'); };
+  ws.onclose = () => log("Disconnected.");
 }
-
-function requestServerTasks(capacity){
-  if(!serverConnected || !ws) return;
-  const msg = { type:'requestTasks', clientId, capacity: Number(capacity) || 4, wantN: inputN.value.trim() };
-  ws.send(JSON.stringify(msg));
-}
-
-function sendServerProgress(taskId, deltaStr){
-  if(!serverConnected || !ws) return;
-  const msg = { type:'progress', clientId, taskId, delta: deltaStr };
-  ws.send(JSON.stringify(msg));
-}
-
-function sendServerFound(factorStr){
-  if(!serverConnected || !ws) return;
-  const msg = { type:'found', clientId, factor: factorStr };
-  ws.send(JSON.stringify(msg));
-}
-
-function sendServerStatus(st){
-  if(!serverConnected || !ws) return;
-  ws.send(JSON.stringify({ type:'status', clientId, status: st }));
-}
-
-function sendServerStateRequest(){
-  if(!serverConnected || !ws) return;
-  ws.send(JSON.stringify({ type:'getState', clientId }));
-}
-
 function handleServerMessage(m){
-  if(m.type === 'assign'){
-    if(!Array.isArray(m.tasks)) return;
-    const desired = Number(workersInput.value) || 4;
-    if(workers.length < desired){
-      workers = [];
-      for(let i=0;i<desired;i++){
-        const info = { id:i, worker:null, offset:0n, lastReported:0n, iterations:0n, status:'idle', c:null, failures:0, restarting:false, lastResponseAt:now(), taskId:null, taskN:null };
-        workers.push(info); renderWorkerRow(info);
-      }
-    }
-    for(let i=0;i<workers.length && m.tasks.length>0;i++){
-      const info = workers[i];
-      if(info.status === 'running' || info.status === 'starting') continue;
-      const t = m.tasks.shift();
-      if(!t) break;
-      info.taskId = t.taskId;
-      info.c = t.c;
-      info.offset = toBigIntSafe(t.offset || '0');
-      info.lastReported = info.offset;
-      info.iterations = info.offset;
-      info.status = 'assigned';
-      info.taskN = t.N || state.N_work || state.originalN || inputN.value;
-      assignedTasksByWorkerId[info.id] = { taskId: t.taskId, c: t.c, offset: info.offset };
-      // spawn worker with correct N
-      const w = spawnWorker(info, adaptive.chunk);
-      info.worker = w;
-      w.postMessage({cmd:'start', N: info.taskN, id: info.id, c: info.c, chunk: adaptive.chunk, taskId: info.taskId});
-      info.lastResponseAt = now();
-    }
-    updateUI();
-    log('Assigned tasks received from server.');
-  } else if(m.type === 'state'){
+  if(m.type==="ack"){ log("Registered as "+m.clientId); }
+  else if(m.type==="state"){
     if(m.state){
       if(m.state.N_original) state.originalN = toBigIntSafe(m.state.N_original);
+      if(m.state.N_work) state.N_work = toBigIntSafe(m.state.N_work);
       if(m.state.totalIterations) state.totalIterations = toBigIntSafe(m.state.totalIterations);
       if(m.state.found) state.found = m.state.found;
-      updateUI();
-      log('Server state received.');
+      log("Server state received.");
     }
-  } else if(m.type === 'ack'){
-    // ignore
-  } else if(m.type === 'error'){
-    log('Server error: ' + (m.message || ''));
+  }
+  else if(m.type==="assign"){
+    for(const t of m.tasks){
+      if(!state.originalN && t.N){
+        state.originalN = toBigIntSafe(t.N);
+        state.N_work = toBigIntSafe(t.N);
+        log("Set originalN from task: "+t.N);
+      }
+      startWorker(t);
+    }
+  }
+}
+function sendProgress(taskId, offset){
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"progress", taskId, offset}));
+  }
+}
+function sendFound(factor, taskId){
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"found", factor, taskId}));
   }
 }
 
-function handleServerDisconnectCleanup(){
-  serverConnected = false;
-  assignedTasksByWorkerId = {};
-  workers.forEach(info => {
-    info.status = 'orphaned';
-    try{ if(info.worker) info.worker.postMessage({cmd:'pause'}); } catch(e){}
-    renderWorkerRow(info);
-  });
+// --- Worker mgmt ---
+function startWorker(task){
+  const id = "w"+(++workerCount);
+  const w = new Worker(workerURL);
+  workers[id] = {w, taskId: task.taskId};
+  w.onmessage = e => {
+    const m = e.data;
+    if(m.type==="progress"){
+      sendProgress(m.taskId, m.offset);
+    } else if(m.type==="found"){
+      const p = BigInt(m.factor);
+      if(state.originalN && p>1n && p<state.originalN && state.originalN%p===0n){
+        log("Factor found! p="+p+" q="+(state.originalN/p));
+        sendFound(p.toString(), m.taskId);
+      } else {
+        log("Worker reported invalid factor "+m.factor);
+      }
+      w.terminate();
+    }
+  };
+  w.postMessage({cmd:"start", N: task.N || state.N_work?.toString() || state.originalN?.toString(), id, c: task.c, chunk: 1000, taskId: task.taskId});
+  log("Started worker "+id+" for task "+task.taskId);
 }
 
-/* ========= Init ========= */
-clearGraph();
-updateUI();
-log('Visualizer ready.');
-
-window.__fv = { state, workers };
+// --- UI buttons ---
+document.getElementById("connectBtn").onclick = connect;
+document.getElementById("startBtn").onclick = () => {
+  if(ws && ws.readyState===1){
+    ws.send(JSON.stringify({type:"requestTasks", capacity:1}));
+  } else log("Not connected.");
+};
+document.getElementById("stopBtn").onclick = () => {
+  for(const id in workers){ workers[id].w.terminate(); }
+  workers={};
+  log("All workers stopped.");
+};
 </script>
 </body>
 </html>
