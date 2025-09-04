@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Factor Visualizer — Server-enabled Pollard-Brent (fixed)</title>
+<title>Factor Visualizer — Server-enabled Pollard-Brent (stable)</title>
 <style>
   :root{--bg:#0f1724;--panel:#0b1220;--accent:#22c1c3;--muted:#94a3b8}
   html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial;color:#e6eef6;background:linear-gradient(180deg,#071129 0%, #071824 100%);}
@@ -35,7 +35,7 @@
 <body>
   <div class="wrap">
     <header>
-      <h1>Factor Visualizer — Server-enabled Pollard-Brent (fixed)</h1>
+      <h1>Factor Visualizer — Server-enabled Pollard-Brent (stable)</h1>
     </header>
 
     <div class="card controls">
@@ -113,7 +113,7 @@
   </div>
 
 <script>
-/* ========= Utils & BigInt helpers ========= */
+/* ---------- Utilities ---------- */
 const $ = id => document.getElementById(id);
 function now(){ return performance.now()/1000; }
 function toBigIntSafe(v){
@@ -124,28 +124,6 @@ function toBigIntSafe(v){
   try { return BigInt(s); } catch(e) { return 0n; }
 }
 function gcd(a,b){ a = a < 0n ? -a : a; b = b < 0n ? -b : b; while(b){ const t = a % b; a = b; b = t; } return a; }
-function modPow(base, exp, mod){ base = base % mod; let result = 1n; while(exp>0n){ if(exp & 1n) result = (result * base) % mod; base = (base * base) % mod; exp >>= 1n; } return result; }
-function isProbablyPrime(n){
-  if(n < 2n) return false;
-  const small = [2n,3n,5n,7n,11n,13n,17n,19n,23n,29n,31n];
-  for(const p of small){ if(n === p) return true; if(n % p === 0n) return false; }
-  let d = n - 1n, s = 0n;
-  while((d & 1n) === 0n){ d >>= 1n; s += 1n; }
-  const bases = [2n,325n,9375n,28178n,450775n,9780504n,1795265022n];
-  for(const a of bases){
-    if(a % n === 0n) continue;
-    let x = modPow(a, d, n);
-    if(x === 1n || x === n-1n) continue;
-    let cont = false;
-    for(let r=1n;r<s;r++){
-      x = (x*x) % n;
-      if(x === n-1n){ cont = true; break; }
-    }
-    if(cont) continue;
-    return false;
-  }
-  return true;
-}
 function kthRootBigInt(n,k){
   if(n < 0n) throw new Error('negative'); if(n === 0n) return 0n;
   let low = 1n, high = n;
@@ -159,7 +137,7 @@ function kthRootBigInt(n,k){
   return low - 1n;
 }
 
-/* ========= Worker code (string blob) ========= */
+/* ---------- Worker code (string blob) ---------- */
 const workerSource = `
 let running = false, paused = false, chunk = 2000, taskId = null, id = null;
 self.onmessage = async (e) => {
@@ -185,7 +163,8 @@ self.onmessage = async (e) => {
           const limit = (r - k) < BigInt(chunk) ? Number(r - k) : chunk;
           for(let i=0;i<limit && running;i++){
             y = f(y);
-            q = (q * ( (x>y)?(x-y):(y-x) )) % N;
+            const diff = x > y ? (x - y) : (y - x);
+            q = (q * diff) % N;
             iterations++;
             const now = performance.now();
             if(now - lastHeartbeat > 800){ self.postMessage({type:'heartbeat', id, taskId, iterations: iterations.toString()}); lastHeartbeat = now; }
@@ -194,7 +173,7 @@ self.onmessage = async (e) => {
               if(paused){ await new Promise(r=>{ const rr=r; self._resume = () => { rr(); }; }); self._resume = null; }
             }
           }
-          // gcd(q, N)
+          // compute gcd(q, N)
           let a = q < 0n ? -q : q, b = N < 0n ? -N : N;
           while(b){ const t = a % b; a = b; b = t; }
           const d = a;
@@ -202,14 +181,13 @@ self.onmessage = async (e) => {
             self.postMessage({type:'found', id, taskId, factor: d.toString(), iterations: iterations.toString()}); return;
           }
           if(d === N){
-            let factor = 1n; let t = ys;
+            let t = ys;
             while(t !== y){
               t = f(t);
-              let aa = x - t; if(aa<0n) aa = -aa;
-              let bb = N < 0n ? -N : N;
-              let a2 = aa, b2 = bb;
+              let diff2 = x > t ? (x - t) : (t - x);
+              let a2 = diff2 < 0n ? -diff2 : diff2, b2 = N < 0n ? -N : N;
               while(b2){ const tt = a2 % b2; a2 = b2; b2 = tt; }
-              factor = a2;
+              const factor = a2;
               if(factor > 1n && factor < N){ self.postMessage({type:'found', id, taskId, factor: factor.toString(), iterations: iterations.toString()}); return; }
             }
             self.postMessage({type:'failed', id, taskId, iterations: iterations.toString()}); return;
@@ -224,26 +202,24 @@ self.onmessage = async (e) => {
   else if(m.cmd === 'setChunk'){ const newChunk = Number(m.chunk); if(newChunk && newChunk > 0){ chunk = newChunk; self.postMessage({type:'chunkAck', id: m.id, taskId, chunk}); } }
 };
 `;
-
 const workerBlob = new Blob([workerSource], {type:'application/javascript'});
 const workerURL = URL.createObjectURL(workerBlob);
 
-/* ========= App state ========= */
+/* ---------- App state ---------- */
 let workers = [];
 let state = {
-  originalN: null,   // user-entered, canonical N (string or BigInt)
-  N_work: null,      // reduced N that workers factor (BigInt)
+  originalN: null,   // BigInt or null
+  N_work: null,      // BigInt or null
   totalIterations: 0n,
   t0: 0,
   running: false,
   records: [],
   found: null,
   emaRate: 0,
-  smallFactors: []   // small prime factors removed by trial division (BigInt array)
+  smallFactors: []
 };
-let adaptive = { lastAdjust: 0, chunk: Number(document.getElementById('iterChunk')?.value || 2000), targetChunkMs: 100 };
+let adaptive = { lastAdjust: 0, chunk: Number($('iterChunk')?.value || 2000), targetChunkMs: 100 };
 
-/* DOM refs */
 const inputN = $('inputN'), workersInput = $('workers'), iterChunkInput = $('iterChunk'), delayInput = $('delay');
 const startBtn = $('startBtn'), pauseBtn = $('pauseBtn'), stopBtn = $('stopBtn'), resetBtn = $('resetBtn');
 const saveBtn = $('saveBtn'), loadFile = $('loadFile'), pasteLoadBtn = $('pasteLoadBtn'), pasteArea = $('pasteArea');
@@ -253,7 +229,7 @@ const serverModeCheckbox = $('serverMode'), serverUrlInput = $('serverUrl'), con
 
 function log(msg){ const t = new Date().toLocaleTimeString(); logArea.innerText = `[${t}] ${msg}\n` + logArea.innerText; if(logArea.innerText.length > 20000) logArea.innerText = logArea.innerText.slice(0,20000); }
 
-/* Graphing & UI helpers */
+/* ---------- Graphing & UI helpers ---------- */
 function clearGraph(){ graphCtx.fillStyle='#021021'; graphCtx.fillRect(0,0,graphCanvas.width,graphCanvas.height); }
 function drawSpeedGraph(){
   clearGraph();
@@ -334,7 +310,7 @@ function updateUI(){
     state.emaRate = state.emaRate ? (alpha*inst + (1-alpha)*state.emaRate) : inst;
   }
 
-  // ETA ...
+  // ETA
   let etaText = '—';
   if(state.emaRate > 1e-6 && state.N_work){
     try {
@@ -355,7 +331,7 @@ function updateUI(){
   drawSpeedGraph();
 }
 
-/* ========= Worker UI rendering ========= */
+/* ---------- Worker rows ---------- */
 function renderWorkerRow(info){
   let el = document.getElementById('w-' + info.id);
   if(!el){
@@ -373,7 +349,7 @@ function renderWorkerRow(info){
   if(stat) stat.textContent = `${info.status} · ${iterNum.toString()}`;
 }
 
-/* ========= Local worker spawn & messaging ========= */
+/* ---------- Spawn & manage workers ---------- */
 function spawnWorker(info, chunk){
   const w = new Worker(workerURL);
   info.worker = w;
@@ -393,7 +369,6 @@ function spawnWorker(info, chunk){
         state.totalIterations += delta;
         info.lastReported = workerTotal;
         info.iterations = workerTotal;
-        // forward to server if in server mode and assigned task
         if(serverConnected && assignedTasksByWorkerId[info.id]) {
           sendServerProgress(assignedTasksByWorkerId[info.id].taskId, delta.toString());
         }
@@ -407,7 +382,6 @@ function spawnWorker(info, chunk){
       renderWorkerRow(info);
       log(`Worker ${info.id} acked chunk=${m.chunk}`);
     } else if(m.type === 'found'){
-      // Safer handling: validate factor against original and worker-assigned N
       const iterSinceStart = BigInt(m.iterations || '0');
       const workerTotal = (info.offset || 0n) + iterSinceStart;
       info.lastReported = workerTotal;
@@ -431,9 +405,7 @@ function spawnWorker(info, chunk){
           log(`Worker ${info.id} reported factor ${factor} which does NOT divide original N (${origN}). Ignoring.`);
           return;
         }
-        // compute cofactor relative to originalN
         const other = origN / factor;
-        // canonicalize with smallFactors if any
         let pStr = factor.toString();
         let qStr = other.toString();
         if(state.smallFactors && state.smallFactors.length > 0){
@@ -496,8 +468,7 @@ function scheduleWorkerRestartWithBackoff(info){
     info.status = 'restarting';
     renderWorkerRow(info);
     info.c = info.c || (BigInt(Math.floor(Math.random()*1e9)+1)).toString();
-    // ensure the worker gets the right N
-    const NforWorker = (info.taskN || state.N_work || state.originalN || state.N_work || inputN.value).toString();
+    const NforWorker = (info.taskN || state.N_work || state.originalN || inputN.value).toString();
     info.taskN = NforWorker;
     const w = spawnWorker(info, adaptive.chunk);
     info.worker = w;
@@ -507,7 +478,6 @@ function scheduleWorkerRestartWithBackoff(info){
   }, delay);
 }
 
-/* Restart worker chunk in-place or respawn if unresponsive */
 function restartWorkersSequentially(newChunk){
   if(workers.length === 0) return;
   adaptive.chunk = newChunk;
@@ -570,14 +540,12 @@ function restartWorkersSequentially(newChunk){
   step();
 }
 
-/* Terminate workers */
 function terminateWorkers(){
   workers.forEach(w=>{ try{ if(w.pendingAckTimeout) clearTimeout(w.pendingAckTimeout); if(w.worker) w.worker.terminate(); }catch(e){} });
   workers = [];
   log('All workers terminated.');
 }
 
-/* Monitor loop to restart stuck workers */
 function monitorWorkers(){
   workers.forEach(info=>{
     if(!info.worker) return;
@@ -592,7 +560,7 @@ function monitorWorkers(){
   });
 }
 
-/* ========= Start/Pause/Stop/Reset ========= */
+/* ---------- Start/Pause/Stop/Reset ---------- */
 function startWorkers(){
   if(state.found){ alert('Factor already found: ' + JSON.stringify(state.found)); return; }
   if(startWorkers._starting) return;
@@ -605,12 +573,12 @@ function startWorkers(){
   const N = toBigIntSafe(Nraw);
   if(N < 4n){ alert('Please enter N >= 4'); startWorkers._starting = false; return; }
 
-  // preserve canonical originalN
+  // set canonical originalN if not already set (but prefer server-provided)
   state.originalN = state.originalN || N;
   if(!state.t0) state.t0 = now();
   state.running = true;
 
-  // modest trial division on fresh run to remove tiny primes
+  // trial divide tiny primes if first run and N_work not set
   if(state.totalIterations === 0n && (!state.N_work)){
     let nrem = state.originalN;
     state.smallFactors = state.smallFactors || [];
@@ -624,14 +592,13 @@ function startWorkers(){
       if(bp*bp > nrem) break;
     }
     if(nrem === 1n){
-      // completely factored
       state.found = { p: state.smallFactors.map(x=>x.toString()).join(' × '), q: '1' };
       state.running = false; updateUI(); startWorkers._starting = false; return;
     }
-    state.N_work = nrem; // workers should factor this
+    state.N_work = nrem;
   }
 
-  // spawn logic: server mode vs local
+  // spawn or request tasks
   if(serverConnected){
     requestServerTasks(k);
   } else {
@@ -709,7 +676,7 @@ function resetState(){
   if(serverConnected) sendServerStateRequest();
 }
 
-/* Adaptive chunk tuning */
+/* ---------- Adaptive chunk ---------- */
 function adaptiveAdjust(){
   const t = now();
   if(t - adaptive.lastAdjust < 2) return;
@@ -730,7 +697,7 @@ function adaptiveAdjust(){
   }
 }
 
-/* ========= Save / Load local ========= */
+/* ---------- Save/load local ---------- */
 function buildSaveObject(){
   return {
     meta: { savedAt: (new Date()).toISOString(), version: 11 },
@@ -828,7 +795,7 @@ function loadStateFromJSON(text){
   log('State loaded from JSON. Ready to resume.');
 }
 
-/* ========= Controls wiring ========= */
+/* ---------- Controls wiring ---------- */
 startBtn.addEventListener('click', ()=>{ startWorkers(); });
 pauseBtn.addEventListener('click', ()=>{ pauseWorkers(); });
 stopBtn.addEventListener('click', ()=>{ stopWorkers(); });
@@ -841,9 +808,9 @@ iterChunkInput.addEventListener('change', ()=>{
   log(`User changed iterChunk to ${newChunk}`);
 });
 
-/* ========= Server integration ========= */
+/* ---------- Server integration ---------- */
 let ws = null, serverConnected = false, clientId = null;
-let assignedTasksByWorkerId = {}; // local workerId -> {taskId, c, offset}
+let assignedTasksByWorkerId = {};
 function makeClientId(){ return 'c-' + Math.random().toString(36).slice(2,10); }
 
 connectServerBtn.addEventListener('click', ()=>{
@@ -854,12 +821,7 @@ connectServerBtn.addEventListener('click', ()=>{
 
 function connectToServer(url){
   if(ws){ try{ ws.close(); }catch(e){} ws = null; serverConnected = false; }
-  try{
-    ws = new WebSocket(url);
-  } catch(e){
-    alert('Failed to construct WebSocket');
-    return;
-  }
+  try{ ws = new WebSocket(url); } catch(e){ alert('Failed to construct WebSocket'); return; }
   clientId = clientId || makeClientId();
   ws.onopen = ()=> {
     serverConnected = true;
@@ -931,9 +893,14 @@ function handleServerMessage(m){
       info.lastReported = info.offset;
       info.iterations = info.offset;
       info.status = 'assigned';
-      info.taskN = t.N || state.N_work || state.originalN || inputN.value;
+      info.taskN = t.N || state.N_work ? state.N_work.toString() : (state.originalN ? state.originalN.toString() : inputN.value);
       assignedTasksByWorkerId[info.id] = { taskId: t.taskId, c: t.c, offset: info.offset };
-      // spawn worker with correct N
+      // If client doesn't know canonical N, adopt it
+      if(!state.originalN && t.N){
+        state.originalN = toBigIntSafe(t.N);
+        state.N_work = toBigIntSafe(t.N);
+        log('Client set originalN from assigned task: ' + t.N);
+      }
       const w = spawnWorker(info, adaptive.chunk);
       info.worker = w;
       w.postMessage({cmd:'start', N: info.taskN, id: info.id, c: info.c, chunk: adaptive.chunk, taskId: info.taskId});
@@ -944,6 +911,7 @@ function handleServerMessage(m){
   } else if(m.type === 'state'){
     if(m.state){
       if(m.state.N_original) state.originalN = toBigIntSafe(m.state.N_original);
+      if(m.state.N_work) state.N_work = toBigIntSafe(m.state.N_work);
       if(m.state.totalIterations) state.totalIterations = toBigIntSafe(m.state.totalIterations);
       if(m.state.found) state.found = m.state.found;
       updateUI();
@@ -966,7 +934,7 @@ function handleServerDisconnectCleanup(){
   });
 }
 
-/* ========= Init ========= */
+/* ---------- Init ---------- */
 clearGraph();
 updateUI();
 log('Visualizer ready.');
