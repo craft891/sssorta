@@ -1,15 +1,19 @@
 // server.js
-// Robust task orchestrator for Factor Visualizer cluster
-// - prevents duplicate/overlapping task assignments
-// - creates unique tasks when needed (unique c seeds)
-// - reassigns tasks previously claimed by the same client (resumable)
-// - reclaims tasks from timed-out clients (periodic loop)
-// - validates 'found' reports against N_original
-// - atomic state.json writes
+// Robust orchestrator for Factor Visualizer cluster (optimized, defensive, logged)
+//
+// Features:
+//  - atomic, debounced saves to state.json (safe + efficient)
+//  - immediate save on critical events (found/progress/task-create/release)
+//  - unique seed generation using crypto
+//  - prevents duplicate task claims; returns tasks already claimed by requester first
+//  - admin endpoints for inspection and maintenance
+//  - detailed logging to console and found.log on successful factor discovery
+//  - graceful shutdown (SIGINT/SIGTERM) with state flush
 //
 // Usage: node server.js
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
@@ -18,11 +22,16 @@ const cors = require('cors');
 const PORT = process.env.PORT || 3000;
 const STATE_FILE = path.join(process.cwd(), 'state.json');
 const TMP_STATE = STATE_FILE + '.tmp';
+const FOUND_LOG = path.join(process.cwd(), 'found.log');
+
 const CHECK_INTERVAL_MS = 3000;
 const CLIENT_TIMEOUT_SEC = 20;
+const SAVE_DEBOUNCE_MS = 600;
+const MAX_SERVER_TASKS = 10000; // safety cap to avoid runaway creation
 
+// ---------- Basic server state ----------
 let state = {
-  meta: { createdAt: new Date().toISOString(), version: 1 },
+  meta: { createdAt: new Date().toISOString(), version: 2 },
   N_original: null,    // canonical original N (string)
   N_work: null,        // N workers should factor (string)
   totalIterations: "0",// decimal string
@@ -32,95 +41,221 @@ let state = {
   lastSaved: null
 };
 
+// ---------- Logging helpers ----------
+function isoTs(){ return new Date().toISOString(); }
+function log(...args){
+  console.log(`[${isoTs()}]`, ...args);
+}
+function warn(...args){
+  console.warn(`[${isoTs()}] WARN:`, ...args);
+}
+function errlog(...args){
+  console.error(`[${isoTs()}] ERROR:`, ...args);
+}
+function appendFoundLog(entry){
+  try{
+    fs.appendFileSync(FOUND_LOG, entry + '\n', 'utf8');
+  }catch(e){
+    errlog('Failed to append to found.log', e);
+  }
+}
+
+// ---------- Load / Save state (debounced + atomic) ----------
 function safeParseJSON(s){
   try { return JSON.parse(s); } catch(e){ return null; }
 }
-
 function loadStateFromFile(){
   try{
     if(fs.existsSync(STATE_FILE)){
       const raw = fs.readFileSync(STATE_FILE, 'utf8');
       const parsed = safeParseJSON(raw);
       if(parsed && typeof parsed === 'object'){
-        // migrate legacy 'N' field if present
+        // migrate legacy N -> N_original
         if(parsed.N && !parsed.N_original) parsed.N_original = parsed.N;
-        // ensure tasks array exists
         parsed.tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-        // basic normalization
+        // Merge parsed onto default state but preserve runtime fields
         state = Object.assign(state, parsed);
-        console.log('Loaded state from', STATE_FILE);
+        log('Loaded state from', STATE_FILE);
       } else {
-        console.warn('state.json invalid JSON, starting fresh');
+        warn('state.json exists but invalid JSON — starting fresh state');
       }
     } else {
-      console.log('No existing state.json, starting with empty state');
+      log('No state.json found; starting with fresh state');
     }
   }catch(e){
-    console.warn('Failed to load state.json:', e);
+    errlog('Failed to load state.json:', e);
   }
 }
 
-function saveStateToFile(){
+let saveTimer = null;
+let pendingSave = false;
+function scheduleSave(debounceMs = SAVE_DEBOUNCE_MS){
+  pendingSave = true;
+  if(saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    _doSave();
+    pendingSave = false;
+    saveTimer = null;
+  }, debounceMs);
+}
+function _doSave(){
   try{
-    fs.writeFileSync(TMP_STATE, JSON.stringify(state, null, 2), 'utf8');
+    // ensure numeric values are strings
+    if(typeof state.totalIterations !== 'string') state.totalIterations = String(state.totalIterations || '0');
+    const json = JSON.stringify(state, null, 2);
+    fs.writeFileSync(TMP_STATE, json, 'utf8');
     fs.renameSync(TMP_STATE, STATE_FILE);
     state.lastSaved = new Date().toISOString();
+    log('State saved to', STATE_FILE);
   }catch(e){
-    console.warn('Failed to save state.json:', e);
+    errlog('Failed to save state:', e);
   }
 }
+function saveImmediate(){
+  if(saveTimer){ clearTimeout(saveTimer); saveTimer = null; }
+  _doSave();
+  pendingSave = false;
+}
 
-function mkTaskId(){ return 't-' + Math.random().toString(36).slice(2,9); }
+// ---------- Utilities ----------
 function nowSec(){ return Math.floor(Date.now()/1000); }
+function mkTaskId(){ return 't-' + crypto.randomBytes(6).toString('hex'); }
+function uniqueSeed(existingSet){
+  // try random numbers, and fallback to randomBytes hex if collision
+  for(let i=0;i<64;i++){
+    const candidate = String(Math.floor(Math.random()*1e9)+1);
+    if(!existingSet.has(candidate)) return candidate;
+  }
+  // fallback: 8 bytes hex
+  return crypto.randomBytes(8).toString('hex');
+}
+function existingSeedsSet(){
+  const s = new Set();
+  for(const t of state.tasks) s.add(String(t.c));
+  return s;
+}
+function normalizeTask(t){
+  // ensure required fields exist and are strings where expected
+  return {
+    taskId: String(t.taskId),
+    c: String(t.c),
+    offset: String(t.offset || '0'),
+    claimedBy: t.claimedBy === null ? null : String(t.claimedBy),
+    lastUpdate: Number(t.lastUpdate || nowSec()),
+    N: t.N == null ? null : String(t.N)
+  };
+}
 
+// ---------- Load existing state on startup ----------
 loadStateFromFile();
-saveStateToFile();
 
+// ensure tasks are normalized
+state.tasks = state.tasks.map(normalizeTask);
+if(state.N && !state.N_original) state.N_original = state.N;
+if(state.N_original && !state.N_work) state.N_work = state.N_original;
+
+// initial save to populate lastSaved if necessary
+saveImmediate();
+
+// ---------- Express + REST admin endpoints ----------
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(process.cwd()));
+app.use(express.static(process.cwd())); // serve index.html if present
 
-app.get('/state', (req,res) => {
-  res.json(state);
-});
+app.get('/state', (req,res) => { res.json(state); });
 app.get('/download', (req,res) => {
   if(fs.existsSync(STATE_FILE)) return res.download(STATE_FILE);
   res.status(404).send('no state file');
 });
+
+// admin: list clients
+app.get('/admin/clients', (req,res) => { res.json(state.clients); });
+
+// admin: list tasks
+app.get('/admin/tasks', (req,res) => { res.json(state.tasks); });
+
+// admin: unclaim tasks for a client
+app.post('/admin/unclaim/:clientId', (req,res) => {
+  const cid = req.params.clientId;
+  let changed = false;
+  for(const t of state.tasks){
+    if(t.claimedBy === cid){
+      t.claimedBy = null;
+      t.lastUpdate = nowSec();
+      changed = true;
+    }
+  }
+  if(changed) { scheduleSave(0); res.json({ ok:true, msg:'released tasks for ' + cid }); }
+  else res.json({ ok:false, msg:'no tasks claimed by ' + cid });
+});
+
+// admin: clear tasks (dangerous)
+app.post('/admin/clear-tasks', (req,res) => {
+  const keepN = req.body && req.body.keepN;
+  state.tasks = [];
+  if(keepN && state.N_original) {
+    // create single fresh task with unique seed
+    const seed = uniqueSeed(new Set());
+    state.tasks.push(normalizeTask({ taskId: mkTaskId(), c: seed, offset: "0", claimedBy: null, lastUpdate: nowSec(), N: state.N_work || state.N_original }));
+  }
+  scheduleSave(0);
+  res.json({ ok:true, tasks: state.tasks.length });
+});
+
+// admin: create task(s)
+app.post('/admin/create-tasks', (req,res) => {
+  let count = Math.max(1, parseInt(req.body && req.body.count) || 1);
+  const existing = existingSeedsSet();
+  const created = [];
+  // safety cap
+  const totalAfter = state.tasks.length + count;
+  if(totalAfter > MAX_SERVER_TASKS){
+    count = Math.max(0, MAX_SERVER_TASKS - state.tasks.length);
+    if(count === 0) return res.status(400).json({ ok:false, msg:'max tasks reached' });
+  }
+  for(let i=0;i<count;i++){
+    const c = uniqueSeed(existing);
+    existing.add(c);
+    const t = normalizeTask({ taskId: mkTaskId(), c, offset: '0', claimedBy: null, lastUpdate: nowSec(), N: state.N_work || state.N_original || null });
+    state.tasks.push(t);
+    created.push(t);
+  }
+  scheduleSave(0);
+  res.json({ ok:true, created });
+});
+
+// post a single task (compatible with previous API)
 app.post('/task', (req,res) => {
   const { c, offset, N } = req.body || {};
-  const task = {
-    taskId: mkTaskId(),
-    c: String(c || (Math.floor(Math.random()*1e9)+1)),
-    offset: String(offset || '0'),
-    claimedBy: null,
-    lastUpdate: nowSec(),
-    N: String(N || (state.N_work || state.N_original || ''))
-  };
+  const existing = existingSeedsSet();
+  const seed = c ? String(c) : uniqueSeed(existing);
+  const task = normalizeTask({ taskId: mkTaskId(), c: seed, offset: String(offset || '0'), claimedBy: null, lastUpdate: nowSec(), N: N ? String(N) : (state.N_work || state.N_original || null) });
   state.tasks.push(task);
-  saveStateToFile();
+  scheduleSave(0);
   res.json({ ok:true, task });
 });
 
+// ---------- HTTP server + WebSocket ----------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Broadcast helper
 function broadcastToClients(obj){
   const s = JSON.stringify(obj);
   wss.clients.forEach(c => { if(c.readyState === WebSocket.OPEN) c.send(s); });
 }
 
-// reclaim tasks from timed-out clients
-setInterval(()=>{
+// reclaim tasks from timed-out clients (periodic)
+setInterval(() => {
   const now = nowSec();
   let changed = false;
   for(const cid of Object.keys(state.clients)){
     const client = state.clients[cid];
     if(!client) continue;
     if(now - (client.lastSeen || 0) > CLIENT_TIMEOUT_SEC){
-      console.log('Client timed out:', cid);
-      // unclaim tasks assigned to this client
+      log('Client timed out:', cid);
+      // unclaim tasks belonging to this client
       for(const t of state.tasks){
         if(t.claimedBy === cid){
           t.claimedBy = null;
@@ -132,37 +267,20 @@ setInterval(()=>{
       changed = true;
     }
   }
-  if(changed) saveStateToFile();
+  if(changed) scheduleSave(0);
 }, CHECK_INTERVAL_MS);
 
-// helpers to ensure unique c seed
-function existingSeeds(){
-  const s = new Set();
-  for(const t of state.tasks) s.add(String(t.c));
-  return s;
-}
-function uniqueC(){
-  const s = existingSeeds();
-  for(let i=0;i<50;i++){
-    const candidate = String(Math.floor(Math.random()*1e9)+1);
-    if(!s.has(candidate)) return candidate;
-  }
-  // fallback: append timestamp
-  return String(Math.floor(Math.random()*1e9)+1) + '-' + Date.now();
-}
-
-// choose tasks to assign: return array of task objects to send (and mark them claimed)
+// assign tasks to client: ensure tasks claimed atomically (single thread)
 function assignTasksToClient(clientId, capacity){
   if(!clientId) return [];
-  // If we already found factors, don't give new tasks
-  if(state.found) return [];
+  if(state.found) return []; // no work if already found
 
-  // Ensure client record exists and update lastSeen
+  // ensure client record
   state.clients[clientId] = state.clients[clientId] || { lastSeen: nowSec(), capacity: capacity || 1, meta: {} };
   state.clients[clientId].lastSeen = nowSec();
   state.clients[clientId].capacity = capacity || state.clients[clientId].capacity || 1;
 
-  // 1) start with tasks already claimed by this client (so they can resume)
+  // 1) return tasks already claimed by this client
   const assigned = [];
   for(const t of state.tasks){
     if(t.claimedBy === clientId){
@@ -171,49 +289,45 @@ function assignTasksToClient(clientId, capacity){
     }
   }
 
-  // 2) assign unclaimed tasks up to capacity
-  const needed = capacity - assigned.length;
-  if(needed <= 0) return assigned;
-
-  // list unclaimed tasks
+  // 2) collect unclaimed tasks
   const unclaimed = state.tasks.filter(t => !t.claimedBy);
-
-  // If not enough unclaimed tasks, create new ones
-  if(unclaimed.length < needed){
-    const createCount = needed - unclaimed.length;
-    const seeds = existingSeeds();
-    for(let i=0;i<createCount;i++){
-      const c = uniqueC();
-      const nt = {
-        taskId: mkTaskId(),
-        c,
-        offset: "0",
-        claimedBy: null,
-        lastUpdate: nowSec(),
-        N: String(state.N_work || state.N_original || null)
-      };
-      state.tasks.push(nt);
-      unclaimed.push(nt);
+  // create new tasks if insufficient
+  const need = capacity - assigned.length;
+  if(need > 0){
+    // safety: avoid creating new tasks if N_work is missing
+    if(!state.N_work && !state.N_original){
+      // no canonical N known; nothing to create
+      return assigned;
     }
-  }
-
-  // Now pick up to 'needed' unclaimed tasks, mark them claimed
-  let picked = 0;
-  for(const t of state.tasks){
-    if(picked >= needed) break;
-    if(!t.claimedBy){
-      t.claimedBy = clientId;
-      t.lastUpdate = nowSec();
-      assigned.push({ taskId: t.taskId, c: t.c, offset: t.offset, N: t.N });
-      picked++;
+    const existing = existingSeedsSet();
+    if(state.tasks.length < MAX_SERVER_TASKS && unclaimed.length < need){
+      const createCount = Math.min(need - unclaimed.length, Math.max(0, MAX_SERVER_TASKS - state.tasks.length));
+      for(let i=0;i<createCount;i++){
+        const c = uniqueSeed(existing);
+        existing.add(c);
+        const nt = normalizeTask({ taskId: mkTaskId(), c, offset: "0", claimedBy: null, lastUpdate: nowSec(), N: state.N_work || state.N_original || null });
+        state.tasks.push(nt);
+        unclaimed.push(nt);
+      }
+      scheduleSave();
     }
+    // now pick up to 'need' unclaimed tasks and claim them
+    let picked = 0;
+    for(const t of state.tasks){
+      if(picked >= need) break;
+      if(!t.claimedBy){
+        t.claimedBy = clientId;
+        t.lastUpdate = nowSec();
+        assigned.push({ taskId: t.taskId, c: t.c, offset: t.offset, N: t.N });
+        picked++;
+      }
+    }
+    if(picked > 0) scheduleSave();
   }
-
-  // Save state after claiming
-  if(assigned.length > 0) saveStateToFile();
   return assigned;
 }
 
+// ---------- WebSocket message handling ----------
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.on('pong', () => ws.isAlive = true);
@@ -227,34 +341,38 @@ wss.on('connection', (ws, req) => {
     const type = msg.type;
 
     if(type === 'register'){
-      const clientId = msg.clientId || ('c-' + Math.random().toString(36).slice(2,9));
+      const clientId = msg.clientId || ('c-' + crypto.randomBytes(5).toString('hex'));
       state.clients[clientId] = state.clients[clientId] || { lastSeen: nowSec(), capacity: msg.capacity || 1, meta: msg.meta || {} };
       state.clients[clientId].lastSeen = nowSec();
       ws.clientId = clientId;
       ws.send(JSON.stringify({ type:'ack', clientId }));
-      // Immediately send canonical snapshot
+      // send canonical state snapshot
       ws.send(JSON.stringify({ type: 'state', state: {
-        N_original: state.N_original || state.N || null,
-        N_work: state.N_work || state.N_original || null,
+        N_original: state.N_original || null,
+        N_work: state.N_work || null,
         totalIterations: state.totalIterations,
         found: state.found
       }}));
-      console.log('Registered client', clientId, 'capacity', msg.capacity || 1);
+      log('Registered client', clientId, 'capacity', msg.capacity || 1);
     }
 
     else if(type === 'requestTasks'){
       const clientId = msg.clientId;
       if(!clientId) return ws.send(JSON.stringify({ type:'error', message:'no clientId' }));
 
-      // If a client provides wantN and server hasn't been set, set canonical N (but never overwrite once set)
+      // optionally set canonical N from client if server hasn't yet
       if(msg.wantN && !state.N_original){
-        state.N_original = String(msg.wantN);
-        state.N_work = state.N_work || state.N_original;
-        console.log('Server N_original set from client requestTasks:', state.N_original);
-        saveStateToFile();
+        try {
+          state.N_original = String(msg.wantN);
+          state.N_work = state.N_work || state.N_original;
+          log('Server N_original set from client requestTasks:', state.N_original);
+          scheduleSave(0);
+        } catch(e){
+          warn('Invalid wantN provided by client');
+        }
       }
 
-      // If a factor already found, respond with empty assign and state snapshot
+      // If found, return empty and state
       if(state.found){
         ws.send(JSON.stringify({ type:'assign', tasks: [] }));
         ws.send(JSON.stringify({ type:'state', state: { N_original: state.N_original, N_work: state.N_work, totalIterations: state.totalIterations, found: state.found }}));
@@ -262,19 +380,16 @@ wss.on('connection', (ws, req) => {
       }
 
       const capacity = Math.max(1, Number(msg.capacity) || 1);
-      // Update client heartbeat
+      // update client record heartbeat
       state.clients[clientId] = state.clients[clientId] || { lastSeen: nowSec(), capacity, meta: {} };
       state.clients[clientId].lastSeen = nowSec();
       state.clients[clientId].capacity = capacity;
 
-      // Assign tasks (existing claimed by this client + new ones up to capacity)
       const assignedList = assignTasksToClient(clientId, capacity);
 
-      // Send assigned tasks
       ws.send(JSON.stringify({ type:'assign', tasks: assignedList }));
-      // Also send canonical state snapshot to help client bootstrap originalN etc.
       ws.send(JSON.stringify({ type:'state', state: { N_original: state.N_original, N_work: state.N_work, totalIterations: state.totalIterations, found: state.found }}));
-      console.log('Assigned', assignedList.length, 'tasks to', clientId);
+      log(`Assigned ${assignedList.length} tasks to ${clientId}`);
     }
 
     else if(type === 'progress'){
@@ -282,16 +397,15 @@ wss.on('connection', (ws, req) => {
       if(!taskId || !deltaStr) return ws.send(JSON.stringify({ type:'error', message:'bad progress' }));
       const task = state.tasks.find(t => t.taskId === taskId);
       if(!task) return ws.send(JSON.stringify({ type:'error', message:'unknown task' }));
-      // Accept progress only if the task is claimed (by anyone) or unclaimed (allow reporting)
       try {
         const delta = BigInt(String(deltaStr));
         const prev = BigInt(task.offset || '0');
         task.offset = (prev + delta).toString();
         task.lastUpdate = nowSec();
-        // update global total
         const tot = BigInt(state.totalIterations || '0');
         state.totalIterations = (tot + delta).toString();
-        saveStateToFile();
+        scheduleSave();
+        // ack back
         ws.send(JSON.stringify({ type:'ack', taskId }));
       } catch(e){
         ws.send(JSON.stringify({ type:'error', message:'bad delta' }));
@@ -301,24 +415,28 @@ wss.on('connection', (ws, req) => {
     else if(type === 'found'){
       const factorStr = msg.factor;
       const clientId = msg.clientId || ws.clientId;
-      if(!factorStr) return ws.send(JSON.stringify({ type:'error', message:'no factor' }));
+      if(!factorStr) return ws.send(JSON.stringify({ type:'error', message:'no factor provided' }));
       const origStr = state.N_original || state.N || null;
       if(!origStr) return ws.send(JSON.stringify({ type:'error', message:'server has no original N to validate against' }));
-      try{
+      try {
         const p = BigInt(String(factorStr));
         const orig = BigInt(String(origStr));
         if(orig % p !== 0n){
           ws.send(JSON.stringify({ type:'error', message:'reported factor does not divide original N' }));
-          console.warn('Rejected invalid factor', p.toString());
+          warn('Rejected invalid factor', p.toString(), 'from', clientId);
           return;
         }
         const q = orig / p;
         state.found = { p: p.toString(), q: q.toString(), foundBy: clientId, at: new Date().toISOString() };
-        saveStateToFile();
+        // log and persist immediately
+        const foundMsg = `[${isoTs()}] FOUND by ${clientId}: p=${p.toString()} q=${q.toString()} N=${orig.toString()}`;
+        log(foundMsg);
+        appendFoundLog(foundMsg);
+        saveImmediate(); // immediate flush for important event
+        // broadcast canonical state to all clients
         broadcastToClients({ type:'state', state: { N_original: state.N_original, N_work: state.N_work, totalIterations: state.totalIterations, found: state.found }});
-        console.log('FOUND factor accepted:', state.found);
       } catch(e){
-        ws.send(JSON.stringify({ type:'error', message:'invalid factor' }));
+        ws.send(JSON.stringify({ type:'error', message:'invalid factor format' }));
       }
     }
 
@@ -336,24 +454,39 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    if(ws.clientId) console.log('Connection closed for', ws.clientId);
-    // Do not immediately unclaim tasks; reclamation loop will unclaim after timeout
+    if(ws.clientId) log('Connection closed for', ws.clientId);
+    // tasks remain claimed until reclamation loop unclaims them
   });
 
   ws.on('error', (e) => {
-    console.warn('ws error', e);
+    warn('ws error', e);
   });
 });
 
-// periodic ping to clients & cleanup of dead sockets
+// periodic ping / health sweep on sockets
 const pinger = setInterval(() => {
   wss.clients.forEach(ws => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    try { ws.ping(); } catch(e) {}
+    try {
+      if(ws.isAlive === false) return ws.terminate();
+      ws.isAlive = false;
+      ws.ping(() => {});
+    } catch(e){
+      // ignore
+    }
   });
 }, 30000);
 
+// graceful shutdown
+function shutdown(signal){
+  log('Shutting down due to', signal);
+  try { saveImmediate(); } catch(e){ /*ignore*/ }
+  try { server.close(() => { log('HTTP server closed'); process.exit(0); }); } catch(e){}
+  setTimeout(()=>{ process.exit(0); }, 5000);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// start server
 server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  log(`Server listening on port ${PORT}`);
 });
