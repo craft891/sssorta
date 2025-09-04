@@ -1,176 +1,230 @@
-// server.js — orchestrator for factor hive
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const cors = require("cors");
-const { WebSocketServer } = require("ws");
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
 
-const PORT = process.env.PORT || 3000;
-const STATE_FILE = path.join(__dirname, "state.json");
+// Configuration
+const PORT = process.env.PORT || 8080;
+const STALE_TASK_TIMEOUT = 120 * 1000; // 2 minutes
+const TASK_CLEANUP_INTERVAL = 30 * 1000; // Every 30 seconds
 
-let state = {
-  meta: { createdAt: new Date().toISOString(), version: 1 },
-  N_original: null,
-  N_work: null,
-  totalIterations: "0",
-  found: null,
-  tasks: [],
-  clients: {},
-  lastSaved: new Date().toISOString()
-};
+// Server state
+let currentN = null;
+let totalIterations = 0n;
+let foundFactor = null;
+let usedC = new Set();
+let tasks = new Map();
+let clients = new Map();
 
-// --- Helpers ---
-function saveState() {
-  state.lastSaved = new Date().toISOString();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+// Generate unique c values (1-1e9)
+function generateC() {
+  let c;
+  do {
+    c = Math.floor(Math.random() * 1e9) + 1;
+  } while (usedC.has(c));
+  usedC.add(c);
+  return c;
 }
-function loadState() {
-  if (fs.existsSync(STATE_FILE)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (parsed.N && !parsed.N_original) parsed.N_original = parsed.N; // backward compat
-      state = parsed;
-      console.log("Loaded state.json with", state.tasks.length, "tasks.");
-    } catch (e) {
-      console.error("Failed to load state.json", e);
-    }
+
+// Create new factoring task
+function createTask() {
+  const c = generateC();
+  const taskId = uuidv4().slice(0, 8);
+  return {
+    taskId,
+    c: c.toString(),
+    offset: '0',
+    lastProgress: Date.now(),
+    status: 'pending'
+  };
+}
+
+// Assign tasks to client
+function assignTasks(clientId, capacity) {
+  const client = clients.get(clientId);
+  if (!client) return [];
+
+  const assignments = [];
+  for (let i = 0; i < capacity; i++) {
+    const task = createTask();
+    task.assignedClientId = clientId;
+    task.status = 'assigned';
+    tasks.set(task.taskId, task);
+    assignments.push(task);
+    client.tasks.add(task.taskId);
   }
+  return assignments;
 }
-function broadcast(msg) {
-  const data = JSON.stringify(msg);
-  wss.clients.forEach(c => {
-    if (c.readyState === 1) c.send(data);
+
+// Broadcast state to all clients
+function broadcastState() {
+  const state = {
+    N_original: currentN,
+    totalIterations: totalIterations.toString(),
+    found: foundFactor
+  };
+  
+  clients.forEach(client => {
+    if (client.socket.readyState === WebSocket.OPEN) {
+      client.socket.send(JSON.stringify({ 
+        type: 'state', 
+        state 
+      }));
+    }
   });
 }
 
-// --- Express API ---
-const app = express();
-app.use(cors());
-app.use(express.json());
+// Cleanup stale tasks
+function cleanupStaleTasks() {
+  const now = Date.now();
+  tasks.forEach((task, taskId) => {
+    if (task.status === 'assigned' && (now - task.lastProgress > STALE_TASK_TIMEOUT)) {
+      console.log(`Reassigning stale task: ${taskId}`);
+      const client = clients.get(task.assignedClientId);
+      if (client) client.tasks.delete(taskId);
+      task.status = 'pending';
+      task.assignedClientId = null;
+    }
+  });
+}
 
-app.get("/state", (req, res) => res.json(state));
-app.get("/download", (req, res) => {
-  res.setHeader("Content-Disposition", "attachment; filename=state.json");
-  res.json(state);
-});
+// Reset job for new N
+function resetJob(newN) {
+  currentN = newN;
+  totalIterations = 0n;
+  foundFactor = null;
+  usedC = new Set();
+  tasks = new Map();
+  broadcastState();
+}
 
-const server = app.listen(PORT, () =>
-  console.log("HTTP listening on", PORT)
-);
+// Initialize WebSocket server
+const wss = new WebSocket.Server({ port: PORT });
 
-// --- WebSocket ---
-const wss = new WebSocketServer({ server });
+wss.on('connection', (socket) => {
+  let clientId = null;
+  let clientCapacity = 1;
 
-wss.on("connection", ws => {
-  ws.on("message", raw => {
-    let msg;
+  socket.on('message', (data) => {
     try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    const { type } = msg;
-
-    if (type === "register") {
-      const id = msg.clientId || "c-" + Math.random().toString(36).slice(2, 8);
-      ws.clientId = id;
-      state.clients[id] = {
-        lastSeen: Date.now() / 1000,
-        capacity: msg.capacity || 1,
-        meta: msg.meta || {}
-      };
-      ws.send(JSON.stringify({ type: "ack", clientId: id }));
-      // send canonical state immediately
-      ws.send(
-        JSON.stringify({
-          type: "state",
-          state: {
-            N_original: state.N_original,
-            N_work: state.N_work,
-            totalIterations: state.totalIterations,
-            found: state.found
-          }
-        })
-      );
-      console.log("Client registered", id);
-    }
-
-    else if (type === "requestTasks") {
-      const id = ws.clientId;
-      if (!id) return;
-      const capacity = msg.capacity || 1;
-      const unclaimed = state.tasks.filter(t => !t.claimedBy);
-      const assign = unclaimed.slice(0, capacity);
-      assign.forEach(t => {
-        t.claimedBy = id;
-        t.lastUpdate = Date.now() / 1000;
-      });
-      ws.send(JSON.stringify({ type: "assign", tasks: assign }));
-    }
-
-    else if (type === "progress") {
-      const { taskId, offset } = msg;
-      const task = state.tasks.find(t => t.taskId === taskId);
-      if (task) {
-        task.offset = String(offset);
-        task.lastUpdate = Date.now() / 1000;
+      const msg = JSON.parse(data);
+      
+      // Registration
+      if (msg.type === 'register') {
+        clientId = msg.clientId || uuidv4();
+        clientCapacity = Math.max(1, Math.min(128, msg.capacity || 4));
+        
+        if (clients.has(clientId)) {
+          const oldClient = clients.get(clientId);
+          if (oldClient.socket !== socket) oldClient.socket.close();
+        }
+        
+        clients.set(clientId, {
+          capacity: clientCapacity,
+          socket,
+          tasks: new Set(),
+          lastSeen: Date.now()
+        });
+        
+        socket.send(JSON.stringify({ type: 'ack', clientId }));
+        console.log(`Registered client: ${clientId} (capacity: ${clientCapacity})`);
       }
-    }
-
-    else if (type === "found") {
-      const factorStr = msg.factor;
-      if (!factorStr) return;
-      const origStr = state.N_original;
-      if (!origStr) return;
-      try {
-        const p = BigInt(factorStr);
-        const orig = BigInt(origStr);
-        if (orig % p !== 0n) {
-          console.warn("Rejected invalid factor", p.toString());
+      
+      // Task requests
+      else if (msg.type === 'requestTasks') {
+        if (!clientId) return;
+        
+        const wantN = (msg.wantN || '').trim();
+        if (!wantN) {
+          socket.send(JSON.stringify({ 
+            type: 'error', 
+            message: 'Missing N value' 
+          }));
           return;
         }
-        const q = orig / p;
-        state.found = {
-          p: p.toString(),
-          q: q.toString(),
-          foundBy: msg.clientId || ws.clientId,
-          at: new Date().toISOString()
-        };
-        saveState();
-        broadcast({
-          type: "state",
-          state: {
-            N_original: state.N_original,
-            totalIterations: state.totalIterations,
-            found: state.found
-          }
-        });
-        console.log("Factor found:", state.found);
-      } catch (e) {
-        console.error("Invalid factor from client", e);
-      }
-    }
 
-    else if (type === "heartbeat") {
-      if (ws.clientId && state.clients[ws.clientId]) {
-        state.clients[ws.clientId].lastSeen = Date.now() / 1000;
+        // Initialize or reset job
+        if (!currentN) {
+          resetJob(wantN);
+        } 
+        else if (currentN !== wantN && totalIterations === 0n) {
+          resetJob(wantN);
+        }
+        else if (currentN !== wantN) {
+          socket.send(JSON.stringify({ 
+            type: 'error', 
+            message: `Job in progress for N=${currentN}` 
+          }));
+          return;
+        }
+
+        // Handle completed job
+        if (foundFactor) {
+          socket.send(JSON.stringify({ type: 'assign', tasks: [] }));
+          return;
+        }
+
+        // Assign new tasks
+        const assignments = assignTasks(clientId, clientCapacity);
+        socket.send(JSON.stringify({ type: 'assign', tasks: assignments }));
       }
+      
+      // Progress updates
+      else if (msg.type === 'progress') {
+        if (!clientId) return;
+        
+        const task = tasks.get(msg.taskId);
+        if (!task || task.assignedClientId !== clientId) return;
+        
+        task.lastProgress = Date.now();
+        try {
+          totalIterations += BigInt(msg.delta);
+          broadcastState();
+        } catch (e) {
+          console.error('Invalid progress delta:', msg.delta);
+        }
+      }
+      
+      // Factor found
+      else if (msg.type === 'found') {
+        if (!clientId || foundFactor) return;
+        foundFactor = msg.factor;
+        console.log(`FACTOR FOUND: ${msg.factor}`);
+        broadcastState();
+      }
+      
+      // State requests
+      else if (msg.type === 'getState') {
+        if (clientId) {
+          socket.send(JSON.stringify({ 
+            type: 'state', 
+            state: {
+              N_original: currentN,
+              totalIterations: totalIterations.toString(),
+              found: foundFactor
+            }
+          }));
+        }
+      }
+    } catch (e) {
+      console.error('Message error:', e);
     }
   });
 
-  ws.on("close", () => {
-    const id = ws.clientId;
-    if (id) {
-      Object.values(state.tasks).forEach(t => {
-        if (t.claimedBy === id) t.claimedBy = null;
+  socket.on('close', () => {
+    if (clientId && clients.has(clientId)) {
+      const client = clients.get(clientId);
+      client.tasks.forEach(taskId => {
+        const task = tasks.get(taskId);
+        if (task) {
+          task.status = 'pending';
+          task.assignedClientId = null;
+        }
       });
-      delete state.clients[id];
+      clients.delete(clientId);
     }
   });
 });
 
-// --- Periodic save ---
-setInterval(() => saveState(), 10000);
+// Periodic cleanup
+setInterval(cleanupStaleTasks, TASK_CLEANUP_INTERVAL);
 
-// --- Init ---
-loadState();
+console.log(`Server running on port ${PORT}`);
